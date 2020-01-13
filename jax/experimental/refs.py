@@ -5,23 +5,43 @@ from jax import numpy as jnp
 from jax import random
 from jax.util import partial
 
+from collections import defaultdict
 import threading
+
+class NoValue:
+  pass
+
+no_value = NoValue()
 
 class Ref(threading.local):
   """A container for managing state in Python."""
   __slots__ = ["value"]
-  def __init__(self, value):
+
+  def __init__(self, value=no_value):
     super().__init__()
     self.value = value
+
   def __repr__(self):
     return self.__class__.__name__ + '(' + repr(self.value) + ')'
+
   def load(self):
+    if self.value is no_value:
+      raise RuntimeError("Cannot load from empty ref.")
     return self.value
+
   def store(self, value):
     self.value = value
-  def swap(self, value):
-    value, self.value = self.value, value
-    return value
+
+  # def swap(self, value):
+  #   if self.value is no_value:
+  #     raise RuntimeError("Cannot swap into empty ref.")
+  #   value, self.value = self.value, value
+  #   return value
+
+  # def initialize(self, value)
+  #   if self.value is no_value:
+  #     self.value = value
+  #   return self.value
 
 # Three choices for Ref's pytree behavior:
 # 1. register Ref as a pytree with its object identity as metadata
@@ -62,29 +82,113 @@ def inject(fun, ref_tree):
 
 # examples
 
-ref = Ref(None)
+refs = [Ref(), Ref()]
+
+# foo :: [Writer(refs)] float -> [Writer(refs)] float
 def foo(x):
   y = x ** 2
-  ref.store(y)
+  refs[0].store(y)
+  refs[1].store(y - 1)
   return y + 1
 
-# tagging
+# pure_foo :: float -> List[float], float
+pure_foo = collect(foo, refs)
+assert pure_foo(3) == ([9, 8], 10)
 
-_tags = dict()
-def tag(value, name):
-  if name in _tags:
-    return _tags[name].swap(value)
+aux = Ref()
+def fn_with_aux(x):
+  y = x ** 2
+  aux.store(y)
+  z = y + 1
+  return z
+
+assert collect(fn_with_aux, aux)(2) == (4, 5)
+# with_refs(grad, yref)(bar)
+
+## tagging
+
+_tag_refs = Ref(dict())
+def tag(name, value=no_value):
+  _tag_vals = _tag_refs.load()
+  if name not in _tag_vals:
+    assert value is not no_value
+    _tag_vals[name] = value
   else:
-    _tags[name] = Ref(value)
-    return value
+    value, _tag_vals[name] = _tag_vals[name], value
+  _tag_refs.store(_tag_vals)
+  return value
 
-# NNs
+# _tag_refs = defaultdict(lambda: Ref(no_value))
+# def tag(name, value=no_value):
+#   ref = _tag_refs[name]
+#   if ref.value is no_value:
+#     ref.store(value)
+#   else:
+#     return ref.load()
 
-_global_PRNG_key = Ref(random.PRNGKey(0))
+def tagged_fn_with_aux(x):
+  y = x ** 2
+  tag('y', y)
+  z = y + 1
+  return z
+
+assert collect(tagged_fn_with_aux, _tag_refs)(2) == ({'y': 4}, 5)
+
+def tagged_fn_with_intermediate(x):
+  y = x ** 2
+  y = tag('y', y)
+  z = y + 1
+  return z
+
+assert inject(tagged_fn_with_intermediate, _tag_refs)({'y': 3}, 2) == 4
+
+## PRNGs
+
+_global_PRNG_key = Ref()
 def next_key():
   key1, key2 = random.split(_global_PRNG_key.load())
   _global_PRNG_key.store(key1)
   return key2
+
+# example
+
+def stateful_normal():
+  return random.normal(next_key())
+
+pure_normal = inject(stateful_normal, _global_PRNG_key)
+pure_normal(random.PRNGKey(2))
+
+# # wrapping transforms
+
+# @lu.transformation
+# def _collect_and_inject(fun, ref_tree, val_tree, *args, **kwargs):
+#   tree_store(ref_tree, val_tree)
+#   out = yield args, kwargs
+#   val_tree = tree_load(ref_tree)
+#   return val_tree, out
+
+# _treelike_kwargs = {'in_axes', 'out_axes', 'tangents'}
+# _listlike_kwargs = {'static_argnums'}
+
+# def with_refs(transform, ref_tree, **ref_kwargs):
+#   def transform_with_refs(fun, *transform_args, **transform_kwargs):
+#     fun = collect_and_inject(fun, )
+#     def inner(*args, **kwargs):
+#       fun = lu.wrap_init(fun)
+#       fun = _collect_and_inject(fun)
+#       args, in_tree = tree_flatten((args, kwargs))
+#       flat_fun, out_tree = flatten_fun(f, in_tree)
+#     for k, v in transform_kwargs.items():
+#       if k in _listlike_kwargs:
+
+#     def inner(*args, **kwargs):
+#       for k, v in transform_kwargs.items():
+#         if k in _listlike_kwargs:
+#           kwargs
+#         args_flat, in_tree = tree_flatten((tree_load(refs), *args))
+#       fun = collect_and_inject(fun, refs)
+
+# neural nets
 
 class Parameter(Ref):
   """A trainable parameter."""
